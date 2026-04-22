@@ -7,6 +7,7 @@ import asyncio
 import html
 import socket
 import time
+import re
 from datetime import datetime
 from threading import Thread
 from flask import Flask
@@ -64,7 +65,6 @@ def get_uptime():
 
 
 def decode_mime_words(s):
-    """Fayl nomlari va sarlavhalarni to'g'ri dekodlash"""
     if not s: return ""
     try:
         parts = decode_header(s)
@@ -80,22 +80,35 @@ def decode_mime_words(s):
 
 
 def get_email_body(msg):
-    """Xat matnini ajratib olish"""
+    """Xat matnini har qanday formatdan (HTML yoki Plain) tozalab ajratib olish"""
+    body = ""
     if msg.is_multipart():
         for part in msg.walk():
             content_type = part.get_content_type()
             content_disposition = str(part.get("Content-Disposition"))
-            if content_type == "text/plain" and "attachment" not in content_disposition:
+            if content_type in ["text/plain", "text/html"] and "attachment" not in content_disposition:
                 try:
-                    return part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8', errors='ignore')
+                    payload = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8',
+                                                                   errors='ignore')
+                    if content_type == "text/html":
+                        # HTML teglarni tozalash
+                        payload = re.sub(r'<[^>]+>', '', payload)
+                        payload = html.unescape(payload)
+                    body += payload + "\n"
                 except:
                     pass
     else:
         try:
-            return msg.get_payload(decode=True).decode(msg.get_content_charset() or 'utf-8', errors='ignore')
+            body = msg.get_payload(decode=True).decode(msg.get_content_charset() or 'utf-8', errors='ignore')
+            if msg.get_content_type() == "text/html":
+                body = re.sub(r'<[^>]+>', '', body)
+                body = html.unescape(body)
         except:
             pass
-    return ""
+
+    # Ortiqcha bo'sh qatorlarni qisqartirish
+    body = re.sub(r'\n\s*\n', '\n\n', body)
+    return body.strip()
 
 
 # --- 1. MAIL.RU -> TELEGRAM (Monitoring) ---
@@ -116,27 +129,24 @@ async def check_mail_loop(context: ContextTypes.DEFAULT_TYPE):
                         msg = email.message_from_bytes(response_part[1])
                         subject = decode_mime_words(msg["Subject"])
                         sender = decode_mime_words(msg["From"])
-                        raw_body = get_email_body(msg).strip()
+                        raw_body = get_email_body(msg)
 
-                        # --- AQLLI FILTR: Xatni "From:" so'zi uchun o'chirib yubormaslik ---
-                        # Faqat Forward qilingan xabarlarning eski zanjirini kesamiz
+                        # Forward qilingan xabarlarning faqat o'ta uzun zanjirlarini kesish
                         cut_keywords = ["--------- Forwarded message ---------",
                                         "---------- Пересылаемое сообщение ----------"]
                         for word in cut_keywords:
-                            if word in raw_body:
-                                raw_body = raw_body.split(word)[0]
+                            if word in raw_body: raw_body = raw_body.split(word)[0]
 
                         stats["received"] += 1
                         clean_body = raw_body.strip()
                         if len(clean_body) > 3000: clean_body = clean_body[:3000] + "..."
 
-                        # NBU formatidagi xabar matni
                         caption = (
                             "🏦 <b>OʻZMILLIY BANK tizimidan xabar!</b>\n"
                             "━━━━━━━━━━━━━━━━━━\n"
                             f"👤 <b>Kimdan:</b> <code>{html.escape(sender)}</code>\n"
                             f"📝 <b>Mavzu:</b> <u>{html.escape(subject)}</u>\n\n"
-                            f"📄 <b>Matn:</b>\n<i>{html.escape(clean_body) if clean_body else 'Xat matni boʻsh.'}</i>\n"
+                            f"📄 <b>Matn:</b>\n<i>{html.escape(clean_body) if clean_body else 'Xat matni faqat rasmlardan iborat yoki boʻsh.'}</i>\n"
                             "━━━━━━━━━━━━━━━━━━"
                         )
 
@@ -163,7 +173,7 @@ async def check_mail_loop(context: ContextTypes.DEFAULT_TYPE):
                 pass
 
 
-# --- 2. TELEGRAM -> MAIL.RU (Fayl yuborish) ---
+# --- 2. TELEGRAM -> MAIL.RU (Yuborish) ---
 async def handle_files_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID: return
     msg = update.message
@@ -204,53 +214,37 @@ async def handle_files_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         stats["errors"] += 1
 
 
-# --- 3. ADMIN PANEL (Reply Keyboard) ---
+# --- 3. ADMIN PANEL ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID: return
-
-    keyboard = [
-        [KeyboardButton("🔄 Pochtani tekshirish")],
-        [KeyboardButton("📊 Statistika"), KeyboardButton("⚙️ Sozlamalar")]
-    ]
+    keyboard = [[KeyboardButton("🔄 Pochtani tekshirish")],
+                [KeyboardButton("📊 Statistika"), KeyboardButton("⚙️ Sozlamalar")]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-    await update.message.reply_text(
-        "👋 <b>NBU Mail Admin Panelga xush kelibsiz!</b>\n\nMenyudan foydalaning:",
-        parse_mode='HTML',
-        reply_markup=reply_markup
-    )
+    await update.message.reply_text("🏦 <b>NBU Mail Admin Panel</b>\nMenyudan foydalaning:", parse_mode='HTML',
+                                    reply_markup=reply_markup)
 
 
 async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID: return
     text = update.message.text
-
     if text == "🔄 Pochtani tekshirish":
-        await update.message.reply_text("🔍 Pochta tekshirilmoqda...")
+        await update.message.reply_text("🔍 Tekshirilmoqda...")
         await check_mail_loop(context)
-        await update.message.reply_text("✅ Tekshiruv yakunlandi.")
-
+        await update.message.reply_text("✅ Tugallandi.")
     elif text == "📊 Statistika":
-        msg = (f"📊 <b>Bot Statistikasi:</b>\n\n"
-               f"📥 Kelgan xatlar: {stats['received']}\n"
-               f"📤 Yuborilganlar: {stats['sent']}\n"
-               f"⚠️ Xatoliklar: {stats['errors']}\n"
-               f"⏰ Uptime: {get_uptime()}")
-        await update.message.reply_text(msg, parse_mode='HTML')
-
+        await update.message.reply_text(
+            f"📊 <b>Statistika:</b>\n\n📥 Kelgan: {stats['received']}\n📤 Yuborilgan: {stats['sent']}\n⚠️ Xatolar: {stats['errors']}\n⏰ Uptime: {get_uptime()}",
+            parse_mode='HTML')
     elif text == "⚙️ Sozlamalar":
-        settings = (f"⚙️ <b>Hozirgi sozlamalar:</b>\n\n"
-                    f"📧 Mail: <code>{MAIL_USER}</code>\n"
-                    f"🎯 To: <code>{MAIL_TO_ADDR}</code>\n"
-                    f"🆔 Admin ID: <code>{ADMIN_CHAT_ID}</code>")
-        await update.message.reply_text(settings, parse_mode='HTML')
+        await update.message.reply_text(
+            f"⚙️ <b>Sozlamalar:</b>\n\n📧 Mail: <code>{MAIL_USER}</code>\n🎯 To: <code>{MAIL_TO_ADDR}</code>",
+            parse_mode='HTML')
 
 
-# --- ASOSIY QISM ---
+# --- ASOSIY ---
 def main():
     keep_alive()
     application = Application.builder().token(BOT_TOKEN).build()
-
     admin_filter = filters.Chat(chat_id=ADMIN_CHAT_ID)
 
     application.add_handler(CommandHandler("start", start, filters=admin_filter))
@@ -262,7 +256,7 @@ def main():
     if application.job_queue:
         application.job_queue.run_repeating(check_mail_loop, interval=60, first=10)
 
-    logging.info("NBU Mail Bot ishga tushdi.")
+    logging.info("Bot polling boshlandi...")
     application.run_polling(drop_pending_updates=True)
 
 
