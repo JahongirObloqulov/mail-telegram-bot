@@ -24,7 +24,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 MAIL_USER = os.getenv("MAIL_USER")
 MAIL_PASS = os.getenv("MAIL_PASS")
-MAIL_TO_ADDR = os.getenv("MAIL_TO")
+MAIL_TO_ADDR = os.getenv("MAIL_TO", "example@nbu.uz")
 
 IMAP_SERVER = "imap.mail.ru"
 SMTP_SERVER = "smtp.mail.ru"
@@ -50,21 +50,15 @@ def run_flask():
     server.run(host='0.0.0.0', port=port)
 
 
-def keep_alive():
-    t = Thread(target=run_flask)
-    t.daemon = True
-    t.start()
-
-
 # --- YORDAMCHI FUNKSIYALAR ---
 def get_uptime():
     uptime_seconds = int(time.time() - START_TIME)
-    minutes, seconds = divmod(uptime_seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}s {minutes}m {seconds}s"
+    h, m = divmod(uptime_seconds // 60, 60)
+    return f"{h}s {m}m {uptime_seconds % 60}s"
 
 
 def decode_mime_words(s):
+    """Sarlavhalar va fayl nomlarini to'g'ri dekodlash"""
     if not s: return ""
     try:
         parts = decode_header(s)
@@ -74,13 +68,14 @@ def decode_mime_words(s):
                 decoded += word.decode(encoding or "utf-8", errors="replace")
             else:
                 decoded += word
+        # O'zbekcha tutuq belgilarini standartlashtirish
         return decoded.replace("’", "'").replace("‘", "'").replace("`", "'").strip()
     except:
         return str(s)
 
 
 def get_email_body(msg):
-    """Xat matnini har qanday formatdan (HTML yoki Plain) tozalab ajratib olish"""
+    """HTML va Plain matnlarni tozalab ajratib olish"""
     body = ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -91,7 +86,7 @@ def get_email_body(msg):
                     payload = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8',
                                                                    errors='ignore')
                     if content_type == "text/html":
-                        # HTML teglarni tozalash
+                        # HTML teglarni tozalash (Fwd xatlar uchun muhim)
                         payload = re.sub(r'<[^>]+>', '', payload)
                         payload = html.unescape(payload)
                     body += payload + "\n"
@@ -106,7 +101,7 @@ def get_email_body(msg):
         except:
             pass
 
-    # Ortiqcha bo'sh qatorlarni qisqartirish
+    # Ortiqcha bo'shliqlar va "Disclaimer" qismini biroz tartibga solish
     body = re.sub(r'\n\s*\n', '\n\n', body)
     return body.strip()
 
@@ -131,22 +126,21 @@ async def check_mail_loop(context: ContextTypes.DEFAULT_TYPE):
                         sender = decode_mime_words(msg["From"])
                         raw_body = get_email_body(msg)
 
-                        # Forward qilingan xabarlarning faqat o'ta uzun zanjirlarini kesish
-                        cut_keywords = ["--------- Forwarded message ---------",
-                                        "---------- Пересылаемое сообщение ----------"]
-                        for word in cut_keywords:
-                            if word in raw_body: raw_body = raw_body.split(word)[0]
-
                         stats["received"] += 1
+                        # Xat matni bo'sh bo'lmasligini ta'minlash
                         clean_body = raw_body.strip()
-                        if len(clean_body) > 3000: clean_body = clean_body[:3000] + "..."
+                        if not clean_body:
+                            clean_body = "Xat matni bo'sh yoki faqat rasmlardan iborat."
+
+                        # Telegram xabar limiti (4096) dan oshmasligi uchun
+                        final_text = clean_body[:3500]
 
                         caption = (
                             "🏦 <b>OʻZMILLIY BANK tizimidan xabar!</b>\n"
                             "━━━━━━━━━━━━━━━━━━\n"
                             f"👤 <b>Kimdan:</b> <code>{html.escape(sender)}</code>\n"
                             f"📝 <b>Mavzu:</b> <u>{html.escape(subject)}</u>\n\n"
-                            f"📄 <b>Matn:</b>\n<i>{html.escape(clean_body) if clean_body else 'Xat matni faqat rasmlardan iborat yoki boʻsh.'}</i>\n"
+                            f"📄 <b>Matn:</b>\n<i>{html.escape(final_text)}</i>\n"
                             "━━━━━━━━━━━━━━━━━━"
                         )
 
@@ -154,13 +148,16 @@ async def check_mail_loop(context: ContextTypes.DEFAULT_TYPE):
 
                         # Fayllarni yuborish
                         for part in msg.walk():
-                            if part.get_content_maintype() == 'multipart' or part.get(
-                                'Content-Disposition') is None: continue
+                            if part.get_content_maintype() == 'multipart' or part.get('Content-Disposition') is None:
+                                continue
                             filename = decode_mime_words(part.get_filename())
                             file_data = part.get_payload(decode=True)
                             if file_data:
-                                await context.bot.send_document(chat_id=ADMIN_CHAT_ID, document=file_data,
-                                                                filename=filename or "hujjat")
+                                await context.bot.send_document(
+                                    chat_id=ADMIN_CHAT_ID,
+                                    document=file_data,
+                                    filename=filename or f"hujjat_{int(time.time())}"
+                                )
                 mail.store(num, '+FLAGS', '\\Seen')
     except Exception as e:
         logging.error(f"Pochta monitoringida xato: {e}")
@@ -178,20 +175,12 @@ async def handle_files_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.effective_chat.id != ADMIN_CHAT_ID: return
     msg = update.message
 
-    if msg.document:
-        file = await msg.document.get_file()
-        file_name = msg.document.file_name
-    elif msg.photo:
-        file = await msg.photo[-1].get_file()
-        file_name = f"photo_{int(time.time())}.jpg"
-    elif msg.video:
-        file = await msg.video.get_file()
-        file_name = msg.video.file_name or f"video_{int(time.time())}.mp4"
-    elif msg.audio:
-        file = await msg.audio.get_file()
-        file_name = msg.audio.file_name or f"audio_{int(time.time())}.mp3"
-    else:
-        return
+    # Faylni aniqlash
+    file_obj = msg.document or (msg.photo[-1] if msg.photo else None) or msg.video or msg.audio
+    if not file_obj: return
+
+    file = await file_obj.get_file()
+    file_name = getattr(file_obj, 'file_name', f"file_{int(time.time())}")
 
     status_msg = await msg.reply_text("⏳ Pochtaga yuborilmoqda...")
     try:
@@ -200,7 +189,7 @@ async def handle_files_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         email_msg['Subject'] = f"NBU Mail Bot: {file_name}"
         email_msg['From'] = MAIL_USER
         email_msg['To'] = MAIL_TO_ADDR
-        email_msg.set_content(f"Ilova qilingan fayl: {file_name}\n\nUshbu xabar Telegram bot orqali yuborildi.")
+        email_msg.set_content(f"Fayl yuborildi: {file_name}")
         email_msg.add_attachment(file_bytes, maintype='application', subtype='octet-stream', filename=file_name)
 
         with smtplib.SMTP_SSL(SMTP_SERVER, 465) as smtp:
@@ -214,14 +203,14 @@ async def handle_files_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         stats["errors"] += 1
 
 
-# --- 3. ADMIN PANEL ---
+# --- 3. ADMIN PANEL (Reply Keyboard) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_CHAT_ID: return
-    keyboard = [[KeyboardButton("🔄 Pochtani tekshirish")],
-                [KeyboardButton("📊 Statistika"), KeyboardButton("⚙️ Sozlamalar")]]
-    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    await update.message.reply_text("🏦 <b>NBU Mail Admin Panel</b>\nMenyudan foydalaning:", parse_mode='HTML',
-                                    reply_markup=reply_markup)
+    kb = [[KeyboardButton("🔄 Pochtani tekshirish")], [KeyboardButton("📊 Statistika"), KeyboardButton("⚙️ Sozlamalar")]]
+    await update.message.reply_text(
+        "🏦 <b>NBU Mail Admin Panel</b>\nMenyudan foydalaning:",
+        parse_mode='HTML', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
+    )
 
 
 async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -234,30 +223,32 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📊 Statistika":
         await update.message.reply_text(
             f"📊 <b>Statistika:</b>\n\n📥 Kelgan: {stats['received']}\n📤 Yuborilgan: {stats['sent']}\n⚠️ Xatolar: {stats['errors']}\n⏰ Uptime: {get_uptime()}",
-            parse_mode='HTML')
+            parse_mode='HTML'
+        )
     elif text == "⚙️ Sozlamalar":
         await update.message.reply_text(
             f"⚙️ <b>Sozlamalar:</b>\n\n📧 Mail: <code>{MAIL_USER}</code>\n🎯 To: <code>{MAIL_TO_ADDR}</code>",
-            parse_mode='HTML')
+            parse_mode='HTML'
+        )
 
 
 # --- ASOSIY ---
 def main():
-    keep_alive()
-    application = Application.builder().token(BOT_TOKEN).build()
+    Thread(target=run_flask, daemon=True).start()
+    app = Application.builder().token(BOT_TOKEN).build()
     admin_filter = filters.Chat(chat_id=ADMIN_CHAT_ID)
 
-    application.add_handler(CommandHandler("start", start, filters=admin_filter))
-    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & admin_filter, handle_menu_text))
-    application.add_handler(
+    app.add_handler(CommandHandler("start", start, filters=admin_filter))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & admin_filter, handle_menu_text))
+    app.add_handler(
         MessageHandler((filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO) & admin_filter,
                        handle_files_upload))
 
-    if application.job_queue:
-        application.job_queue.run_repeating(check_mail_loop, interval=60, first=10)
+    if app.job_queue:
+        app.job_queue.run_repeating(check_mail_loop, interval=60, first=10)
 
-    logging.info("Bot polling boshlandi...")
-    application.run_polling(drop_pending_updates=True)
+    logging.info("Bot ishga tushdi.")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == '__main__':
