@@ -23,7 +23,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 MAIL_USER = os.getenv("MAIL_USER")
 MAIL_PASS = os.getenv("MAIL_PASS")
-MAIL_TO_ADDR = os.getenv("MAIL_TO", "example@nbu.uz")
+MAIL_TO_ADDR = os.getenv("MAIL_TO")
 
 IMAP_SERVER = "imap.mail.ru"
 SMTP_SERVER = "smtp.mail.ru"
@@ -64,7 +64,7 @@ def get_uptime():
 
 
 def decode_mime_words(s):
-    """Fayl nomlari va mavzulardagi o'zbekcha belgilarni (tutuq belgisi) to'g'ri dekodlash"""
+    """Fayl nomlari va sarlavhalarni to'g'ri dekodlash"""
     if not s: return ""
     try:
         parts = decode_header(s)
@@ -74,7 +74,6 @@ def decode_mime_words(s):
                 decoded += word.decode(encoding or "utf-8", errors="replace")
             else:
                 decoded += word
-        # O'zbekcha tutuq belgilarini (', ’, ‘, `) standartlashtirish
         return decoded.replace("’", "'").replace("‘", "'").replace("`", "'").strip()
     except:
         return str(s)
@@ -119,10 +118,15 @@ async def check_mail_loop(context: ContextTypes.DEFAULT_TYPE):
                         sender = decode_mime_words(msg["From"])
                         raw_body = get_email_body(msg).strip()
 
-                        # Faqat yangi qismini qoldirish
-                        if "From:" in raw_body: raw_body = raw_body.split("From:")[0]
-                        stats["received"] += 1
+                        # --- AQLLI FILTR: Xatni "From:" so'zi uchun o'chirib yubormaslik ---
+                        # Faqat Forward qilingan xabarlarning eski zanjirini kesamiz
+                        cut_keywords = ["--------- Forwarded message ---------",
+                                        "---------- Пересылаемое сообщение ----------"]
+                        for word in cut_keywords:
+                            if word in raw_body:
+                                raw_body = raw_body.split(word)[0]
 
+                        stats["received"] += 1
                         clean_body = raw_body.strip()
                         if len(clean_body) > 3000: clean_body = clean_body[:3000] + "..."
 
@@ -164,7 +168,6 @@ async def handle_files_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
     if update.effective_chat.id != ADMIN_CHAT_ID: return
     msg = update.message
 
-    # Fayl turi va nomini aniqlash (Document, Photo, Video, Audio)
     if msg.document:
         file = await msg.document.get_file()
         file_name = msg.document.file_name
@@ -245,20 +248,17 @@ async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- ASOSIY QISM ---
 def main():
-    keep_alive()  # Flaskni fonda ishga tushirish
+    keep_alive()
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Admin filter
     admin_filter = filters.Chat(chat_id=ADMIN_CHAT_ID)
 
-    # Handlerlar
     application.add_handler(CommandHandler("start", start, filters=admin_filter))
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & admin_filter, handle_menu_text))
     application.add_handler(
         MessageHandler((filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO) & admin_filter,
                        handle_files_upload))
 
-    # Avtomatik monitoring (har 60 soniyada)
     if application.job_queue:
         application.job_queue.run_repeating(check_mail_loop, interval=60, first=10)
 
