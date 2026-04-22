@@ -8,7 +8,6 @@ import html
 import socket
 import time
 import re
-from datetime import datetime
 from threading import Thread
 from flask import Flask
 from dotenv import load_dotenv
@@ -17,32 +16,25 @@ from email.message import EmailMessage
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- SOZLAMALARNI YUKLASH ---
+# --- SOZLAMALAR ---
 load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 MAIL_USER = os.getenv("MAIL_USER")
 MAIL_PASS = os.getenv("MAIL_PASS")
-MAIL_TO_ADDR = os.getenv("MAIL_TO", "example@nbu.uz")
+MAIL_TO_ADDR = os.getenv("MAIL_TO")
 
 IMAP_SERVER = "imap.mail.ru"
 SMTP_SERVER = "smtp.mail.ru"
 
-# Statistika va Uptime uchun
-START_TIME = time.time()
-stats = {"received": 0, "sent": 0, "errors": 0}
+stats = {"received": 0, "sent": 0}
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-
-# --- FLASK SERVER (Render/Uptime uchun) ---
+logging.basicConfig(level=logging.INFO)
 server = Flask(__name__)
 
 
 @server.route('/')
-def home():
-    uptime = int(time.time() - START_TIME)
-    return f"NBU Bot Online. Uptime: {uptime}s | Received: {stats['received']}"
+def home(): return "NBU Bot: Clean & Online"
 
 
 def run_flask():
@@ -50,15 +42,8 @@ def run_flask():
     server.run(host='0.0.0.0', port=port)
 
 
-# --- YORDAMCHI FUNKSIYALAR ---
-def get_uptime():
-    uptime_seconds = int(time.time() - START_TIME)
-    h, m = divmod(uptime_seconds // 60, 60)
-    return f"{h}s {m}m {uptime_seconds % 60}s"
-
-
+# --- FUNKSIYALAR ---
 def decode_mime_words(s):
-    """Sarlavhalar va fayl nomlarini to'g'ri dekodlash"""
     if not s: return ""
     try:
         parts = decode_header(s)
@@ -68,25 +53,21 @@ def decode_mime_words(s):
                 decoded += word.decode(encoding or "utf-8", errors="replace")
             else:
                 decoded += word
-        # O'zbekcha tutuq belgilarini standartlashtirish
         return decoded.replace("’", "'").replace("‘", "'").replace("`", "'").strip()
     except:
         return str(s)
 
 
 def get_email_body(msg):
-    """HTML va Plain matnlarni tozalab ajratib olish"""
     body = ""
     if msg.is_multipart():
         for part in msg.walk():
-            content_type = part.get_content_type()
-            content_disposition = str(part.get("Content-Disposition"))
-            if content_type in ["text/plain", "text/html"] and "attachment" not in content_disposition:
+            if part.get_content_type() in ["text/plain", "text/html"] and "attachment" not in str(
+                    part.get("Content-Disposition")):
                 try:
                     payload = part.get_payload(decode=True).decode(part.get_content_charset() or 'utf-8',
                                                                    errors='ignore')
-                    if content_type == "text/html":
-                        # HTML teglarni tozalash (Fwd xatlar uchun muhim)
+                    if part.get_content_type() == "text/html":
                         payload = re.sub(r'<[^>]+>', '', payload)
                         payload = html.unescape(payload)
                     body += payload + "\n"
@@ -101,155 +82,111 @@ def get_email_body(msg):
         except:
             pass
 
-    # Ortiqcha bo'shliqlar va "Disclaimer" qismini biroz tartibga solish
-    body = re.sub(r'\n\s*\n', '\n\n', body)
-    return body.strip()
+    # Disclaimer matnlarini tozalash
+    patterns = [
+        r"Ushbu xabar va unga qo'shimchalar.*",
+        r"Настоящее сообщение и любые приложения к нему.*",
+        r"This e-mail is intended only for the person.*",
+        r"_{10,}"  # 10 tadan ko'p chiziqlarni o'chirish
+    ]
+    for p in patterns:
+        body = re.sub(p, "", body, flags=re.DOTALL | re.IGNORECASE)
+
+    return re.sub(r'\n\s*\n', '\n\n', body).strip()
 
 
-# --- 1. MAIL.RU -> TELEGRAM (Monitoring) ---
-async def check_mail_loop(context: ContextTypes.DEFAULT_TYPE):
+# --- MONITORING ---
+async def check_mail(context: ContextTypes.DEFAULT_TYPE):
     mail = None
     try:
-        socket.setdefaulttimeout(30)
         mail = imaplib.IMAP4_SSL(IMAP_SERVER)
         mail.login(MAIL_USER, MAIL_PASS)
         mail.select("INBOX")
-        status, messages = mail.search(None, 'UNSEEN')
+        _, messages = mail.search(None, 'UNSEEN')
 
-        if status == "OK" and messages[0]:
+        if messages[0]:
             for num in messages[0].split():
-                res, msg_data = mail.fetch(num, "(RFC822)")
-                for response_part in msg_data:
-                    if isinstance(response_part, tuple):
-                        msg = email.message_from_bytes(response_part[1])
-                        subject = decode_mime_words(msg["Subject"])
-                        sender = decode_mime_words(msg["From"])
-                        raw_body = get_email_body(msg)
+                _, data = mail.fetch(num, "(RFC822)")
+                msg = email.message_from_bytes(data[0][1])
+                sender = decode_mime_words(msg["From"])
+                subject = decode_mime_words(msg["Subject"])
+                body = get_email_body(msg)
 
-                        stats["received"] += 1
-                        # Xat matni bo'sh bo'lmasligini ta'minlash
-                        clean_body = raw_body.strip()
-                        if not clean_body:
-                            clean_body = "Xat matni bo'sh yoki faqat rasmlardan iborat."
+                stats["received"] += 1
+                caption = (
+                    "🏦 <b>OʻZMILLIY BANK tizimidan xabar!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"👤 <b>Kimdan:</b> <code>{html.escape(sender)}</code>\n"
+                    f"📝 <b>Mavzu:</b> <u>{html.escape(subject)}</u>\n\n"
+                    f"📄 <b>Matn:</b>\n<i>{html.escape(body[:3000]) if body else 'Xat matni boʻsh.'}</i>\n"
+                    "━━━━━━━━━━━━━━━━━━"
+                )
+                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=caption, parse_mode='HTML')
 
-                        # Telegram xabar limiti (4096) dan oshmasligi uchun
-                        final_text = clean_body[:3500]
-
-                        caption = (
-                            "🏦 <b>OʻZMILLIY BANK tizimidan xabar!</b>\n"
-                            "━━━━━━━━━━━━━━━━━━\n"
-                            f"👤 <b>Kimdan:</b> <code>{html.escape(sender)}</code>\n"
-                            f"📝 <b>Mavzu:</b> <u>{html.escape(subject)}</u>\n\n"
-                            f"📄 <b>Matn:</b>\n<i>{html.escape(final_text)}</i>\n"
-                            "━━━━━━━━━━━━━━━━━━"
-                        )
-
-                        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=caption, parse_mode='HTML')
-
-                        # Fayllarni yuborish
-                        for part in msg.walk():
-                            if part.get_content_maintype() == 'multipart' or part.get('Content-Disposition') is None:
-                                continue
-                            filename = decode_mime_words(part.get_filename())
-                            file_data = part.get_payload(decode=True)
-                            if file_data:
-                                await context.bot.send_document(
-                                    chat_id=ADMIN_CHAT_ID,
-                                    document=file_data,
-                                    filename=filename or f"hujjat_{int(time.time())}"
-                                )
+                for part in msg.walk():
+                    if part.get_content_maintype() == 'multipart' or part.get('Content-Disposition') is None: continue
+                    fname = decode_mime_words(part.get_filename())
+                    fdata = part.get_payload(decode=True)
+                    if fdata: await context.bot.send_document(chat_id=ADMIN_CHAT_ID, document=fdata,
+                                                              filename=fname or "hujjat")
                 mail.store(num, '+FLAGS', '\\Seen')
     except Exception as e:
-        logging.error(f"Pochta monitoringida xato: {e}")
-        stats["errors"] += 1
+        logging.error(f"Error: {e}")
     finally:
-        if mail:
-            try:
-                mail.logout()
-            except:
-                pass
+        if mail: mail.logout()
 
 
-# --- 2. TELEGRAM -> MAIL.RU (Yuborish) ---
-async def handle_files_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_CHAT_ID: return
-    msg = update.message
-
-    # Faylni aniqlash
-    file_obj = msg.document or (msg.photo[-1] if msg.photo else None) or msg.video or msg.audio
-    if not file_obj: return
-
-    file = await file_obj.get_file()
-    file_name = getattr(file_obj, 'file_name', f"file_{int(time.time())}")
-
-    status_msg = await msg.reply_text("⏳ Pochtaga yuborilmoqda...")
-    try:
-        file_bytes = await file.download_as_bytearray()
-        email_msg = EmailMessage()
-        email_msg['Subject'] = f"NBU Mail Bot: {file_name}"
-        email_msg['From'] = MAIL_USER
-        email_msg['To'] = MAIL_TO_ADDR
-        email_msg.set_content(f"Fayl yuborildi: {file_name}")
-        email_msg.add_attachment(file_bytes, maintype='application', subtype='octet-stream', filename=file_name)
-
-        with smtplib.SMTP_SSL(SMTP_SERVER, 465) as smtp:
-            smtp.login(MAIL_USER, MAIL_PASS)
-            smtp.send_message(email_msg)
-
-        stats["sent"] += 1
-        await status_msg.edit_text(f"✅ Muvaffaqiyatli yuborildi:\n<code>{MAIL_TO_ADDR}</code>", parse_mode='HTML')
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Xato: {e}")
-        stats["errors"] += 1
-
-
-# --- 3. ADMIN PANEL (Reply Keyboard) ---
+# --- HANDLERLAR ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_CHAT_ID: return
-    kb = [[KeyboardButton("🔄 Pochtani tekshirish")], [KeyboardButton("📊 Statistika"), KeyboardButton("⚙️ Sozlamalar")]]
-    await update.message.reply_text(
-        "🏦 <b>NBU Mail Admin Panel</b>\nMenyudan foydalaning:",
-        parse_mode='HTML', reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True)
-    )
+    kb = [[KeyboardButton("🔄 Pochtani tekshirish")], [KeyboardButton("📊 Statistika")]]
+    await update.message.reply_text("🏦 <b>NBU Mail Admin</b>", parse_mode='HTML',
+                                    reply_markup=ReplyKeyboardMarkup(kb, resize_keyboard=True))
 
 
-async def handle_menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_CHAT_ID: return
-    text = update.message.text
-    if text == "🔄 Pochtani tekshirish":
+async def handle_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "🔄 Pochtani tekshirish":
         await update.message.reply_text("🔍 Tekshirilmoqda...")
-        await check_mail_loop(context)
-        await update.message.reply_text("✅ Tugallandi.")
-    elif text == "📊 Statistika":
-        await update.message.reply_text(
-            f"📊 <b>Statistika:</b>\n\n📥 Kelgan: {stats['received']}\n📤 Yuborilgan: {stats['sent']}\n⚠️ Xatolar: {stats['errors']}\n⏰ Uptime: {get_uptime()}",
-            parse_mode='HTML'
-        )
-    elif text == "⚙️ Sozlamalar":
-        await update.message.reply_text(
-            f"⚙️ <b>Sozlamalar:</b>\n\n📧 Mail: <code>{MAIL_USER}</code>\n🎯 To: <code>{MAIL_TO_ADDR}</code>",
-            parse_mode='HTML'
-        )
+        await check_mail(context)
+        await update.message.reply_text("✅ Yakunlandi.")
+    elif update.message.text == "📊 Statistika":
+        await update.message.reply_text(f"📊 Kelgan xatlar: {stats['received']}")
 
 
-# --- ASOSIY ---
+async def handle_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    file = await (msg.document or msg.photo[-1] or msg.video or msg.audio).get_file()
+    fname = msg.document.file_name if msg.document else f"file_{int(time.time())}"
+    try:
+        f_bytes = await file.download_as_bytearray()
+        em = EmailMessage()
+        em['Subject'] = f"TG: {fname}";
+        em['From'] = MAIL_USER;
+        em['To'] = MAIL_TO_ADDR
+        em.set_content(f"Fayl: {fname}")
+        em.add_attachment(f_bytes, maintype='application', subtype='octet-stream', filename=fname)
+        with smtplib.SMTP_SSL(SMTP_SERVER, 465) as s:
+            s.login(MAIL_USER, MAIL_PASS)
+            s.send_message(em)
+        stats["sent"] += 1
+        await msg.reply_text(f"✅ Yuborildi: {MAIL_TO_ADDR}")
+    except Exception as e:
+        await msg.reply_text(f"❌ Xato: {e}")
+
+
+# --- MAIN ---
 def main():
     Thread(target=run_flask, daemon=True).start()
     app = Application.builder().token(BOT_TOKEN).build()
     admin_filter = filters.Chat(chat_id=ADMIN_CHAT_ID)
 
     app.add_handler(CommandHandler("start", start, filters=admin_filter))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & admin_filter, handle_menu_text))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND) & admin_filter, handle_msg))
     app.add_handler(
         MessageHandler((filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO) & admin_filter,
-                       handle_files_upload))
+                       handle_files))
 
-    if app.job_queue:
-        app.job_queue.run_repeating(check_mail_loop, interval=60, first=10)
-
-    logging.info("Bot ishga tushdi.")
-    app.run_polling(drop_pending_updates=True)
+    if app.job_queue: app.job_queue.run_repeating(check_mail, interval=60, first=10)
+    app.run_polling()
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == '__main__': main()
